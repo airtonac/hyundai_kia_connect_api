@@ -376,6 +376,34 @@ class HyundaiBlueLinkApiBR(ApiImpl):
             "smartKeyBatteryWarning", False
         )
 
+        # --- Extended status (fields the car returns but were previously dropped) ---
+        # Power / ignition states
+        vehicle.accessory_on = state.get("acc")
+        vehicle.transmission_condition = state.get("transCond")
+        vehicle.sleep_mode_check = state.get("sleepModeCheck")
+
+        # Lamp wire status (headlamps, brake lamps, turn signals)
+        lamp = state.get("lampWireStatus", {})
+        head = lamp.get("headLamp", {})
+        if head:
+            vehicle.headlamp_status = head.get("headLampStatus")
+            vehicle.headlamp_left_low = head.get("leftLowLamp")
+            vehicle.headlamp_right_low = head.get("rightLowLamp")
+            vehicle.headlamp_left_high = head.get("leftHighLamp")
+            vehicle.headlamp_right_high = head.get("rightHighLamp")
+            vehicle.headlamp_left_bifunc = head.get("leftBifuncLamp")
+            vehicle.headlamp_right_bifunc = head.get("rightBifuncLamp")
+        stop = lamp.get("stopLamp", {})
+        if stop:
+            vehicle.stop_lamp_left = stop.get("leftLamp")
+            vehicle.stop_lamp_right = stop.get("rightLamp")
+        turn = lamp.get("turnSignalLamp", {})
+        if turn:
+            vehicle.turn_signal_left_front = turn.get("leftFrontLamp")
+            vehicle.turn_signal_right_front = turn.get("rightFrontLamp")
+            vehicle.turn_signal_left_rear = turn.get("leftRearLamp")
+            vehicle.turn_signal_right_rear = turn.get("rightRearLamp")
+
         # Store raw data for future use
         vehicle.data = state
 
