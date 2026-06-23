@@ -478,6 +478,13 @@ class HyundaiBlueLinkApiBR(ApiImpl):
         # Profile rarely changes; fetch only if not already cached
         if vehicle.data_profile is None:
             self._update_vehicle_profile(vehicle, self._get_vehicle_profile(token, vehicle))
+        # Valet mode status
+        try:
+            valet = self.get_valet_mode_status(token, vehicle)
+            if valet is not None:
+                vehicle.valet_mode_on = valet.get("valetMode") == 1
+        except Exception as e:
+            _LOGGER.warning(f"{DOMAIN} - valet status skipped: {e}")
 
     def update_vehicle_with_cached_state(self, token: Token, vehicle: Vehicle) -> None:
         """Update vehicle with cached state from API."""
@@ -763,6 +770,61 @@ class HyundaiBlueLinkApiBR(ApiImpl):
         if "application/json" in content_type:
             return response.json()
         return response.content
+
+    def svm_capture(
+        self, token: Token, vehicle: Vehicle, max_wait: int = 70
+    ) -> bool:
+        """Request a 360 Surround View capture, poll until ready, decode and
+        store the composite JPEG on vehicle.svm_image. Returns True on success.
+
+        Note: the car must be OFF (engine off) for this to succeed; with the
+        engine running the server returns 'SVM ERROR'.
+        """
+        import base64
+
+        msg_id = self.svm_request(token, vehicle)
+        if not msg_id:
+            return False
+
+        end = dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=max_wait)
+        while dt.datetime.now(dt.timezone.utc) < end:
+            sleep(8)
+            try:
+                result = self.svm_poll(token, vehicle, msg_id)
+            except Exception as e:
+                _LOGGER.debug(f"{DOMAIN} - SVM poll error: {e}")
+                continue
+            # JSON dict result
+            if isinstance(result, dict):
+                ret = result.get("retCode")
+                res_msg = result.get("resMsg")
+                if ret == "S" and isinstance(res_msg, dict):
+                    b64 = (res_msg.get("scsDetail") or {}).get("svmImage")
+                    if b64:
+                        try:
+                            vehicle.svm_image = base64.b64decode(b64)
+                            vehicle.svm_image_last_updated = dt.datetime.now(
+                                self.data_timezone
+                            )
+                            return True
+                        except Exception as e:
+                            _LOGGER.warning(f"{DOMAIN} - SVM decode failed: {e}")
+                            return False
+                if ret == "F":
+                    code = result.get("resCode")
+                    # 5911 = not ready yet, keep polling; others = real failure
+                    if code == "5911":
+                        continue
+                    raise APIError(
+                        f"SVM capture failed: {code} {result.get('resMsg')}"
+                    )
+            # raw bytes (image returned directly)
+            elif isinstance(result, (bytes, bytearray)) and len(result) > 2000:
+                vehicle.svm_image = bytes(result)
+                vehicle.svm_image_last_updated = dt.datetime.now(self.data_timezone)
+                return True
+        _LOGGER.warning(f"{DOMAIN} - SVM capture timed out")
+        return False
 
     def get_notification_history(self, token: Token, vehicle: Vehicle) -> list:
         """Get notification history (for debugging and tracking command results)."""

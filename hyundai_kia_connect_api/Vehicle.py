@@ -118,6 +118,11 @@ class Vehicle:
     sim_expiry_date: str = None
     data_profile: dict = None
 
+    # Valet mode + 360 Surround View (Brazil)
+    valet_mode_on: bool = None
+    svm_image: bytes = None
+    svm_image_last_updated: datetime.datetime = None
+
     _outside_temperature: float = None
     _outside_temperature_value: float = None
     _outside_temperature_unit: str = None
