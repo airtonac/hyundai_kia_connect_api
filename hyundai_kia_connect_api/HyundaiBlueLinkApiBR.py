@@ -20,6 +20,7 @@ from .const import (
     ENGINE_TYPES,
     ORDER_STATUS,
     SEAT_STATUS,
+    VALET_MODE_ACTION,
     VEHICLE_LOCK_ACTION,
     WINDOW_STATE,
 )
@@ -679,6 +680,89 @@ class HyundaiBlueLinkApiBR(ApiImpl):
             )
 
         return data.get("msgId")
+
+    def _post_control_v2(
+        self, token: Token, vehicle: Vehicle, path: str, payload: dict, label: str
+    ) -> str:
+        """Shared helper for v2 control commands (control token + standard headers)."""
+        control_token = self._ensure_control_token(token)
+        device_id = token.device_id or self.ccsp_device_id
+
+        url = self._build_api_v2_url(f"spa/vehicles/{vehicle.id}/{path}")
+        headers = self._get_authenticated_headers(token)
+        headers["Authorization"] = control_token
+        headers["ccsp-device-id"] = device_id
+        headers["ccuCCS2ProtocolSupport"] = str(vehicle.ccu_ccs2_protocol_support or 0)
+
+        body = {"deviceId": device_id}
+        body.update(payload)
+        _LOGGER.debug(f"{DOMAIN} - {label} request: {body}")
+
+        response = self.session.post(url, json=body, headers=headers)
+        response.raise_for_status()
+        data = response.json()
+        _LOGGER.debug(f"{DOMAIN} - {label} response: {data}")
+
+        if data.get("retCode") != "S":
+            raise APIError(
+                f"{label} failed: {data.get('resCode')} {data.get('resMsg')}"
+            )
+        return data.get("msgId")
+
+    def start_hazard_lights_and_horn(self, token: Token, vehicle: Vehicle) -> str:
+        """Sound the horn together with the hazard lights."""
+        return self._post_control_v2(
+            token, vehicle, "control/horn", {"action": "on"}, "Horn+lights"
+        )
+
+    def valet_mode_action(
+        self, token: Token, vehicle: Vehicle, action: VALET_MODE_ACTION
+    ) -> str:
+        """Activate or deactivate valet mode."""
+        return self._post_control_v2(
+            token,
+            vehicle,
+            "control/valet",
+            {"action": action.value},
+            f"Valet {action.value}",
+        )
+
+    def get_valet_mode_status(self, token: Token, vehicle: Vehicle) -> dict | None:
+        """Read current valet mode status."""
+        url = self._build_api_url(f"/spa/vehicles/{vehicle.id}/status/valet")
+        headers = self._get_authenticated_headers(token)
+        try:
+            response = self.session.get(url, headers=headers)
+            response.raise_for_status()
+            return response.json().get("resMsg")
+        except Exception as e:
+            _LOGGER.warning(f"{DOMAIN} - Failed to get valet status: {e}")
+            return None
+
+    def svm_request(self, token: Token, vehicle: Vehicle) -> str | None:
+        """Trigger a 360 Surround View capture. Returns msgId to poll with."""
+        url = self._build_api_url(f"/spa/vehicles/{vehicle.id}/svm/async")
+        headers = self._get_authenticated_headers(token)
+        _LOGGER.debug(f"{DOMAIN} - SVM (360 camera) request")
+        response = self.session.post(url, headers=headers)
+        response.raise_for_status()
+        data = response.json()
+        if data.get("retCode") != "S":
+            raise APIError(
+                f"SVM request failed: {data.get('resCode')} {data.get('resMsg')}"
+            )
+        return data.get("msgId")
+
+    def svm_poll(self, token: Token, vehicle: Vehicle, msg_id: str):
+        """Poll for the 360 Surround View result. Returns the raw response."""
+        url = self._build_api_url(f"/spa/vehicles/{vehicle.id}/svm/async")
+        headers = self._get_authenticated_headers(token)
+        response = self.session.get(url, headers=headers, params={"msgId": msg_id})
+        response.raise_for_status()
+        content_type = response.headers.get("Content-Type", "")
+        if "application/json" in content_type:
+            return response.json()
+        return response.content
 
     def get_notification_history(self, token: Token, vehicle: Vehicle) -> list:
         """Get notification history (for debugging and tracking command results)."""
