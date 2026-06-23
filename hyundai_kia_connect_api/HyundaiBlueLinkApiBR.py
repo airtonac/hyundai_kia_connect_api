@@ -382,6 +382,22 @@ class HyundaiBlueLinkApiBR(ApiImpl):
         vehicle.transmission_condition = state.get("transCond")
         vehicle.sleep_mode_check = state.get("sleepModeCheck")
 
+        # Engine oil warning + tail lamp + hazard state
+        vehicle.engine_oil_warning_is_on = state.get("engineOilStatus", False)
+        vehicle.tail_lamp_is_on = bool(state.get("tailLampStatus"))
+        vehicle.hazard_is_on = bool(state.get("hazardStatus"))
+
+        # Remote-control availability + cooldown (seconds the car enforces
+        # between remote commands)
+        remote_wait = state.get("remoteWaitingTimeAlert", {})
+        if remote_wait:
+            vehicle.remote_control_available = bool(
+                remote_wait.get("remoteControlAvailable")
+            )
+            vehicle.remote_control_waiting_time = remote_wait.get(
+                "remoteControlWaitingTime"
+            )
+
         # Lamp wire status (headlamps, brake lamps, turn signals)
         lamp = state.get("lampWireStatus", {})
         head = lamp.get("headLamp", {})
@@ -423,6 +439,45 @@ class HyundaiBlueLinkApiBR(ApiImpl):
             )
             vehicle.location = (lat, lon, location_time)
 
+    def _get_vehicle_profile(self, token: Token, vehicle: Vehicle) -> dict | None:
+        """Get the vehicle capability/profile manifest (SIM, equipment, DTC map)."""
+        url = self._build_api_url(f"/spa/vehicles/{vehicle.id}/profile")
+        headers = self._get_authenticated_headers(token)
+        try:
+            response = self.session.get(url, headers=headers)
+            response.raise_for_status()
+            return response.json()["resMsg"]
+        except Exception as e:
+            _LOGGER.warning(f"{DOMAIN} - Failed to get vehicle profile: {e}")
+            return None
+
+    def _update_vehicle_profile(self, vehicle: Vehicle, profile: dict) -> None:
+        """Store profile data and extract a few useful fields."""
+        if not profile:
+            return
+        vehicle.data_profile = profile
+        try:
+            vin_info = profile.get("vinInfo", [{}])[0]
+            device = vin_info.get("device", {})
+            vehicle.sim_expiry_date = device.get("simEndDate")
+        except (IndexError, AttributeError, KeyError):
+            pass
+
+    def _update_extras(self, token: Token, vehicle: Vehicle) -> None:
+        """Fetch trip stats (today + current month) and profile. Best-effort."""
+        now = dt.datetime.now(self.data_timezone)
+        try:
+            self.update_day_trip_info(token, vehicle, now.strftime("%Y%m%d"))
+        except Exception as e:
+            _LOGGER.warning(f"{DOMAIN} - day trip update skipped: {e}")
+        try:
+            self.update_month_trip_info(token, vehicle, now.strftime("%Y%m"))
+        except Exception as e:
+            _LOGGER.warning(f"{DOMAIN} - month trip update skipped: {e}")
+        # Profile rarely changes; fetch only if not already cached
+        if vehicle.data_profile is None:
+            self._update_vehicle_profile(vehicle, self._get_vehicle_profile(token, vehicle))
+
     def update_vehicle_with_cached_state(self, token: Token, vehicle: Vehicle) -> None:
         """Update vehicle with cached state from API."""
         state = self._get_vehicle_state(token, vehicle, force_refresh=False)
@@ -430,6 +485,7 @@ class HyundaiBlueLinkApiBR(ApiImpl):
 
         self._update_vehicle_properties(vehicle, state)
         self._update_vehicle_location(vehicle, location_data)
+        self._update_extras(token, vehicle)
 
     def force_refresh_vehicle_state(self, token: Token, vehicle: Vehicle) -> None:
         """Force refresh vehicle state (wakes up the vehicle)."""
@@ -438,6 +494,7 @@ class HyundaiBlueLinkApiBR(ApiImpl):
 
         self._update_vehicle_properties(vehicle, state)
         self._update_vehicle_location(vehicle, location_data)
+        self._update_extras(token, vehicle)
 
     def _ensure_control_token(self, token: Token) -> str:
         """Ensure we have a valid control token for remote commands."""

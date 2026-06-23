@@ -106,6 +106,17 @@ class Vehicle:
     smart_key_battery_warning_is_on: bool = None
     washer_fluid_warning_is_on: bool = None
     brake_fluid_warning_is_on: bool = None
+    engine_oil_warning_is_on: bool = None
+
+    # Lamp / remote-control extras (Brazil)
+    tail_lamp_is_on: bool = None
+    hazard_is_on: bool = None
+    remote_control_available: bool = None
+    remote_control_waiting_time: int = None
+
+    # Connected-services SIM (from vehicle profile)
+    sim_expiry_date: str = None
+    data_profile: dict = None
 
     _outside_temperature: float = None
     _outside_temperature_value: float = None
