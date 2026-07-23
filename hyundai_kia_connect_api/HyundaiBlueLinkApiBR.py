@@ -486,40 +486,199 @@ class HyundaiBlueLinkApiBR(ApiImpl):
         except Exception as e:
             _LOGGER.warning(f"{DOMAIN} - valet status skipped: {e}")
 
-    def update_vehicle_with_cached_state(self, token: Token, vehicle: Vehicle) -> None:
-        """Update vehicle with cached state from API."""
-        try:
-            state = self._get_vehicle_state(token, vehicle, force_refresh=False)
-            self._update_vehicle_properties(vehicle, state)
-        except requests.HTTPError as e:
-            if e.response is not None and e.response.status_code == 503:
-                # resCode 5031: car CCU temporarily offline — skip status update
-                # but still fetch location and extras which use separate endpoints.
+    def _fetch_status(self, token: Token, vehicle: Vehicle, force_refresh: bool) -> tuple[dict, bool]:
+        """Fetch vehicle status; returns (state_dict, is_ccs2).
+
+        Tries /status/latest first (v1 format).  On 503 — which the BR backend
+        returns when ccuCCS2ProtocolSupport is mis-reported as 0 but the car
+        actually speaks CCS2 — falls back to /ccs2/carstatus/latest.
+        """
+        url_base = self._build_api_url(f"/spa/vehicles/{vehicle.id}")
+        headers = self._get_authenticated_headers(token)
+        if force_refresh:
+            headers["REFRESH"] = "true"
+
+        if not vehicle.ccu_ccs2_protocol_support:
+            try:
+                r = self.session.get(url_base + "/status/latest", headers=headers)
+                r.raise_for_status()
+                return r.json()["resMsg"], False
+            except requests.HTTPError as e:
+                if e.response is None or e.response.status_code != 503:
+                    raise
                 _LOGGER.warning(
-                    "%s - Vehicle status 503 (CCU offline), skipping status update"
-                    " — location will still be refreshed",
+                    "%s - /status/latest returned 503 (resCode 5031); "
+                    "falling back to CCS2 endpoint",
                     DOMAIN,
                 )
-            else:
-                raise
+
+        # CCS2 path (either configured or fallback)
+        r = self.session.get(url_base + "/ccs2/carstatus/latest", headers=headers)
+        r.raise_for_status()
+        res_msg = r.json().get("resMsg", {})
+        return {
+            "_ccs2_vehicle": res_msg.get("state", {}).get("Vehicle", {}),
+            "_last_update_time": res_msg.get("lastUpdateTime"),
+        }, True
+
+    def _update_vehicle_properties_ccs2(self, vehicle: Vehicle, v: dict, last_update_time: str | None) -> None:
+        """Update vehicle properties from CCS2 /ccs2/carstatus/latest state."""
+
+        def _g(d: dict, *keys, default=None):
+            for k in keys:
+                if not isinstance(d, dict):
+                    return default
+                d = d.get(k, default)
+            return d
+
+        # Timestamp
+        if last_update_time:
+            try:
+                vehicle.last_updated_at = dt.datetime.strptime(
+                    last_update_time.split(".")[0], "%Y%m%d%H%M%S"
+                ).replace(tzinfo=self.data_timezone)
+            except (ValueError, AttributeError):
+                vehicle.last_updated_at = dt.datetime.now(self.data_timezone)
+        else:
+            vehicle.last_updated_at = dt.datetime.now(self.data_timezone)
+
+        # Engine / driving
+        vehicle.engine_is_running = bool(_g(v, "DrivingReady", default=0))
+        vehicle.accessory_on = _g(v, "Electronics", "PowerSupply", "Accessory")
+        vehicle.sleep_mode_check = _g(v, "RemoteControl", "SleepMode")
+
+        # Fuel
+        fuel = _g(v, "Drivetrain", "FuelSystem", default={})
+        vehicle.fuel_level = _g(fuel, "FuelLevel")
+        vehicle.fuel_level_is_low = bool(_g(fuel, "LowFuelWarning", default=0))
+        dte_val = _g(fuel, "DTE", "Total")
+        dte_unit = DISTANCE_UNITS.get(_g(fuel, "DTE", "Unit", default=1))
+        if dte_val is not None:
+            vehicle.fuel_driving_range = (dte_val, dte_unit)
+
+        # Battery (12 V)
+        vehicle.car_battery_percentage = _g(v, "Electronics", "Battery", "Level")
+
+        # Smart key / FOB
+        vehicle.smart_key_battery_warning_is_on = bool(_g(v, "Electronics", "FOB", "LowBattery", default=0))
+
+        # Engine oil
+        vehicle.engine_oil_warning_is_on = bool(
+            _g(v, "Drivetrain", "InternalCombustionEngine", "OilLevelWarning", default=0)
+        )
+
+        # Remote control
+        svc = _g(v, "Service", "ConnectedCar", "RemoteControl", default={})
+        vehicle.remote_control_available = bool(_g(svc, "Available", default=0))
+        vehicle.remote_control_waiting_time = _g(svc, "WaitingTime")
+
+        # Body
+        body = _g(v, "Body", default={})
+        vehicle.hood_is_open = bool(_g(body, "Hood", "Open", default=0))
+        vehicle.trunk_is_open = bool(_g(body, "Trunk", "Open", default=0))
+        vehicle.defrost_is_on = bool(_g(body, "Windshield", "Front", "Defog", "State", default=0))
+        vehicle.back_window_heater_is_on = bool(_g(body, "Windshield", "Rear", "Defog", "State", default=0))
+        vehicle.washer_fluid_warning_is_on = bool(
+            _g(body, "Windshield", "Front", "WasherFluid", "LevelLow", default=0)
+        )
+
+        # Lights
+        lights = _g(body, "Lights", default={})
+        vehicle.hazard_is_on = bool(_g(lights, "Hazard", "Alert", default=0))
+        vehicle.tail_lamp_is_on = bool(_g(lights, "TailLamp", "Alert", default=0))
+        fl = _g(lights, "Front", default={})
+        vehicle.headlamp_status = bool(_g(fl, "HeadLamp", "SystemWarning", default=0))
+        vehicle.headlamp_left_high = bool(_g(fl, "Left", "High", "Warning", default=0))
+        vehicle.headlamp_right_high = bool(_g(fl, "Right", "High", "Warning", default=0))
+        vehicle.headlamp_left_low = bool(_g(fl, "Left", "Low", "Warning", default=0))
+        vehicle.headlamp_right_low = bool(_g(fl, "Right", "Low", "Warning", default=0))
+        vehicle.headlamp_left_bifunc = bool(_g(fl, "Left", "Bifunc", "Warning", default=0))
+        vehicle.headlamp_right_bifunc = bool(_g(fl, "Right", "Bifunc", "Warning", default=0))
+        rl = _g(lights, "Rear", default={})
+        vehicle.stop_lamp_left = bool(_g(rl, "Left", "StopLamp", "Warning", default=0))
+        vehicle.stop_lamp_right = bool(_g(rl, "Right", "StopLamp", "Warning", default=0))
+        vehicle.turn_signal_left_front = bool(_g(fl, "Left", "TurnSignal", "Warning", default=0))
+        vehicle.turn_signal_right_front = bool(_g(fl, "Right", "TurnSignal", "Warning", default=0))
+        vehicle.turn_signal_left_rear = bool(_g(rl, "Left", "TurnSignal", "Warning", default=0))
+        vehicle.turn_signal_right_rear = bool(_g(rl, "Right", "TurnSignal", "Warning", default=0))
+
+        # Cabin
+        cabin = _g(v, "Cabin", default={})
+
+        # Doors
+        r1d = _g(cabin, "Door", "Row1", default={})
+        r2d = _g(cabin, "Door", "Row2", default={})
+        vehicle.front_left_door_is_open = bool(_g(r1d, "Driver", "Open", default=0))
+        vehicle.front_right_door_is_open = bool(_g(r1d, "Passenger", "Open", default=0))
+        vehicle.back_left_door_is_open = bool(_g(r2d, "Left", "Open", default=0))
+        vehicle.back_right_door_is_open = bool(_g(r2d, "Right", "Open", default=0))
+        # Lock=1 means locked; all 4 must be 1 for is_locked=True
+        vehicle.is_locked = (
+            _g(r1d, "Driver", "Lock", default=0) == 1
+            and _g(r1d, "Passenger", "Lock", default=0) == 1
+            and _g(r2d, "Left", "Lock", default=0) == 1
+            and _g(r2d, "Right", "Lock", default=0) == 1
+        )
+
+        # Windows
+        r1w = _g(cabin, "Window", "Row1", default={})
+        r2w = _g(cabin, "Window", "Row2", default={})
+        vehicle.front_left_window_is_open = bool(_g(r1w, "Driver", "Open", default=0))
+        vehicle.front_right_window_is_open = bool(_g(r1w, "Passenger", "Open", default=0))
+        vehicle.back_left_window_is_open = bool(_g(r2w, "Left", "Open", default=0))
+        vehicle.back_right_window_is_open = bool(_g(r2w, "Right", "Open", default=0))
+
+        # Steering wheel heat
+        vehicle.steering_wheel_heater_is_on = bool(_g(cabin, "SteeringWheel", "Heat", "State", default=0))
+
+        # Seat climate (0=Off,1=On,2=n/a in CCS2; SEAT_STATUS[2]="Off" so pass through)
+        r1s = _g(cabin, "Seat", "Row1", default={})
+        r2s = _g(cabin, "Seat", "Row2", default={})
+        vehicle.front_left_seat_status = SEAT_STATUS.get(_g(r1s, "Driver", "Climate", "State"))
+        vehicle.front_right_seat_status = SEAT_STATUS.get(_g(r1s, "Passenger", "Climate", "State"))
+        vehicle.rear_left_seat_status = SEAT_STATUS.get(_g(r2s, "Left", "Climate", "State"))
+        vehicle.rear_right_seat_status = SEAT_STATUS.get(_g(r2s, "Right", "Climate", "State"))
+
+        # HVAC
+        hvac_drv = _g(cabin, "HVAC", "Row1", "Driver", default={})
+        vehicle.air_control_is_on = bool(_g(hvac_drv, "Blower", "SpeedLevel", default=0))
+        temp_val = _g(hvac_drv, "Temperature", "Value")
+        temp_range = _g(cabin, "HVAC", "Temperature", "RangeType", default=0)
+        if temp_val is not None and temp_val != "OFF":
+            try:
+                unit = "°F" if temp_range == 1 else "°C"
+                vehicle.air_temperature = (float(temp_val), unit)
+            except (ValueError, TypeError):
+                pass
+
+        # Chassis
+        vehicle.tire_pressure_all_warning_is_on = bool(_g(v, "Chassis", "Axle", "Tire", "PressureLow", default=0))
+        vehicle.brake_fluid_warning_is_on = bool(_g(v, "Chassis", "Brake", "Fluid", "Warning", default=0))
+
+        vehicle.data = v
+
+    def update_vehicle_with_cached_state(self, token: Token, vehicle: Vehicle) -> None:
+        """Update vehicle with cached state from API."""
+        state, is_ccs2 = self._fetch_status(token, vehicle, force_refresh=False)
+        if is_ccs2:
+            self._update_vehicle_properties_ccs2(
+                vehicle, state["_ccs2_vehicle"], state.get("_last_update_time")
+            )
+        else:
+            self._update_vehicle_properties(vehicle, state)
         location_data = self._get_vehicle_location(token, vehicle)
         self._update_vehicle_location(vehicle, location_data)
         self._update_extras(token, vehicle)
 
     def force_refresh_vehicle_state(self, token: Token, vehicle: Vehicle) -> None:
         """Force refresh vehicle state (wakes up the vehicle)."""
-        try:
-            state = self._get_vehicle_state(token, vehicle, force_refresh=True)
+        state, is_ccs2 = self._fetch_status(token, vehicle, force_refresh=True)
+        if is_ccs2:
+            self._update_vehicle_properties_ccs2(
+                vehicle, state["_ccs2_vehicle"], state.get("_last_update_time")
+            )
+        else:
             self._update_vehicle_properties(vehicle, state)
-        except requests.HTTPError as e:
-            if e.response is not None and e.response.status_code == 503:
-                _LOGGER.warning(
-                    "%s - Vehicle status 503 (CCU offline), skipping forced status"
-                    " refresh — location will still be refreshed",
-                    DOMAIN,
-                )
-            else:
-                raise
         location_data = self._get_vehicle_location(token, vehicle)
         self._update_vehicle_location(vehicle, location_data)
         self._update_extras(token, vehicle)
