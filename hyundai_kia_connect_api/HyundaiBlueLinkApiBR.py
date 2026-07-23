@@ -488,19 +488,39 @@ class HyundaiBlueLinkApiBR(ApiImpl):
 
     def update_vehicle_with_cached_state(self, token: Token, vehicle: Vehicle) -> None:
         """Update vehicle with cached state from API."""
-        state = self._get_vehicle_state(token, vehicle, force_refresh=False)
+        try:
+            state = self._get_vehicle_state(token, vehicle, force_refresh=False)
+            self._update_vehicle_properties(vehicle, state)
+        except requests.HTTPError as e:
+            if e.response is not None and e.response.status_code == 503:
+                # resCode 5031: car CCU temporarily offline — skip status update
+                # but still fetch location and extras which use separate endpoints.
+                _LOGGER.warning(
+                    "%s - Vehicle status 503 (CCU offline), skipping status update"
+                    " — location will still be refreshed",
+                    DOMAIN,
+                )
+            else:
+                raise
         location_data = self._get_vehicle_location(token, vehicle)
-
-        self._update_vehicle_properties(vehicle, state)
         self._update_vehicle_location(vehicle, location_data)
         self._update_extras(token, vehicle)
 
     def force_refresh_vehicle_state(self, token: Token, vehicle: Vehicle) -> None:
         """Force refresh vehicle state (wakes up the vehicle)."""
-        state = self._get_vehicle_state(token, vehicle, force_refresh=True)
+        try:
+            state = self._get_vehicle_state(token, vehicle, force_refresh=True)
+            self._update_vehicle_properties(vehicle, state)
+        except requests.HTTPError as e:
+            if e.response is not None and e.response.status_code == 503:
+                _LOGGER.warning(
+                    "%s - Vehicle status 503 (CCU offline), skipping forced status"
+                    " refresh — location will still be refreshed",
+                    DOMAIN,
+                )
+            else:
+                raise
         location_data = self._get_vehicle_location(token, vehicle)
-
-        self._update_vehicle_properties(vehicle, state)
         self._update_vehicle_location(vehicle, location_data)
         self._update_extras(token, vehicle)
 
